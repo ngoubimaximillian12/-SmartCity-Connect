@@ -1,0 +1,13 @@
+{
+  "name": "smartcity-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "web-portal",
+    "admin-dashboard"
+  ],
+  "scripts": {
+    "lint": "echo \"lint placeholder\"",
+    "test": "echo \"test placeholder\""
+  }
+}
