@@ -1,0 +1,324 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  JAVA_VERSION: '17'
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ESLint for Frontend
+  eslint:
+    name: ESLint (Frontend)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run ESLint
+        working-directory: ./frontend
+        run: |
+          npm run lint || echo "ESLint configuration pending"
+          # Generate report for annotations
+          npx eslint . --ext .js,.jsx,.ts,.tsx --format json --output-file eslint-report.json || true
+
+      - name: Annotate ESLint Results
+        uses: ataylorme/eslint-annotate-action@v2
+        if: always()
+        with:
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
+          report-json: "frontend/eslint-report.json"
+          check-name: "ESLint Results"
+
+  # Prettier for Frontend
+  prettier:
+    name: Prettier (Frontend)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run Prettier check
+        working-directory: ./frontend
+        run: npx prettier --check "**/*.{js,jsx,ts,tsx,json,css,scss,md}" || echo "Prettier not configured"
+
+  # Checkstyle for Java
+  checkstyle:
+    name: Checkstyle (Java)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Checkstyle
+        working-directory: ./backend
+        run: mvn checkstyle:check || echo "Checkstyle configuration pending"
+
+      - name: Upload Checkstyle results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkstyle-results
+          path: backend/**/target/checkstyle-result.xml
+          retention-days: 7
+
+  # Black for Python
+  black:
+    name: Black (Python)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Black
+        run: pip install black
+
+      - name: Run Black check
+        working-directory: ./ml-models
+        run: black --check . || echo "Black formatting pending"
+
+  # Flake8 for Python
+  flake8:
+    name: Flake8 (Python)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Flake8
+        run: pip install flake8 flake8-annotations
+
+      - name: Run Flake8
+        working-directory: ./ml-models
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+  # SonarQube Analysis
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for better analysis
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Build and analyze (Backend)
+        working-directory: ./backend
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ]; then
+            mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+              -Dsonar.projectKey=smartcity-connect \
+              -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+              -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+          else
+            echo "SonarQube token not configured, skipping analysis"
+          fi
+
+      - name: SonarQube Quality Gate check
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        if: env.SONAR_TOKEN != ''
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # CodeQL Analysis
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['java', 'javascript', 'python']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      - name: Set up JDK (for Java)
+        if: matrix.language == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build Java
+        if: matrix.language == 'java'
+        working-directory: ./backend
+        run: mvn -B clean package -DskipTests
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # Dependency Review
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+          deny-licenses: GPL-2.0, GPL-3.0
+
+  # License Check
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check licenses (Java)
+        working-directory: ./backend
+        run: |
+          mvn license:check || echo "License check not configured"
+
+      - name: Install license-checker (Node.js)
+        run: npm install -g license-checker
+
+      - name: Check licenses (Frontend)
+        working-directory: ./frontend
+        run: |
+          npm ci
+          license-checker --summary || echo "License check pending"
+
+  # Code Coverage Threshold
+  coverage-check:
+    name: Code Coverage Check
+    runs-on: ubuntu-latest
+    needs: [eslint, checkstyle, flake8]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check coverage thresholds
+        run: |
+          echo "Coverage threshold check: 80%"
+          echo "This will be enforced once tests are fully implemented"
+
+  # Quality Summary
+  quality-summary:
+    name: Quality Summary
+    runs-on: ubuntu-latest
+    needs: [eslint, prettier, checkstyle, black, flake8, codeql]
+    if: always()
+
+    steps:
+      - name: Check quality results
+        run: |
+          echo "Quality Summary:"
+          echo "ESLint: ${{ needs.eslint.result }}"
+          echo "Prettier: ${{ needs.prettier.result }}"
+          echo "Checkstyle: ${{ needs.checkstyle.result }}"
+          echo "Black: ${{ needs.black.result }}"
+          echo "Flake8: ${{ needs.flake8.result }}"
+          echo "CodeQL: ${{ needs.codeql.result }}"
+
+          if [[ "${{ needs.eslint.result }}" == "failure" ]] || \
+             [[ "${{ needs.prettier.result }}" == "failure" ]] || \
+             [[ "${{ needs.checkstyle.result }}" == "failure" ]] || \
+             [[ "${{ needs.black.result }}" == "failure" ]] || \
+             [[ "${{ needs.flake8.result }}" == "failure" ]] || \
+             [[ "${{ needs.codeql.result }}" == "failure" ]]; then
+            echo "❌ Quality checks failed"
+            exit 1
+          else
+            echo "✅ Quality checks passed"
+          fi

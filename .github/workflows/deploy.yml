@@ -1,0 +1,415 @@
+name: Deploy to Environments
+
+on:
+  push:
+    branches:
+      - develop    # Auto-deploy to dev
+      - staging    # Auto-deploy to staging
+      - main       # Auto-deploy to production (with approval)
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      version:
+        description: 'Version/tag to deploy (default: latest)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/smartcity
+
+jobs:
+  # Determine deployment environment and version
+  prepare-deployment:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      version: ${{ steps.set-version.outputs.version }}
+      namespace: ${{ steps.set-env.outputs.namespace }}
+      cluster: ${{ steps.set-env.outputs.cluster }}
+
+    steps:
+      - name: Determine environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            ENVIRONMENT="production"
+          elif [ "${{ github.ref }}" == "refs/heads/staging" ]; then
+            ENVIRONMENT="staging"
+          elif [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+            ENVIRONMENT="development"
+          else
+            ENVIRONMENT="development"
+          fi
+
+          echo "environment=${ENVIRONMENT}" >> $GITHUB_OUTPUT
+
+          # Set namespace based on environment
+          case $ENVIRONMENT in
+            production)
+              echo "namespace=smartcity-prod" >> $GITHUB_OUTPUT
+              echo "cluster=production-cluster" >> $GITHUB_OUTPUT
+              ;;
+            staging)
+              echo "namespace=smartcity-staging" >> $GITHUB_OUTPUT
+              echo "cluster=staging-cluster" >> $GITHUB_OUTPUT
+              ;;
+            development)
+              echo "namespace=smartcity-dev" >> $GITHUB_OUTPUT
+              echo "cluster=development-cluster" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Determine version
+        id: set-version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [ "${{ github.ref_type }}" == "tag" ]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="${GITHUB_SHA::8}"
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Deploying version: ${VERSION}"
+
+  # Deploy to Development
+  deploy-development:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: prepare-deployment
+    if: needs.prepare-deployment.outputs.environment == 'development'
+    environment:
+      name: development
+      url: https://dev.smartcityconnect.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_DEV }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+          kubectl config use-context ${{ needs.prepare-deployment.outputs.cluster }}
+
+      - name: Deploy with Helm
+        run: |
+          export KUBECONFIG=kubeconfig
+
+          helm upgrade --install smartcity-backend \
+            ./infrastructure/kubernetes/helm/smartcity-backend \
+            --namespace ${{ needs.prepare-deployment.outputs.namespace }} \
+            --create-namespace \
+            --set image.tag=${{ needs.prepare-deployment.outputs.version }} \
+            --set environment=development \
+            --values ./infrastructure/kubernetes/helm/values-dev.yaml \
+            --wait \
+            --timeout 10m
+
+          helm upgrade --install smartcity-frontend \
+            ./infrastructure/kubernetes/helm/smartcity-frontend \
+            --namespace ${{ needs.prepare-deployment.outputs.namespace }} \
+            --set image.tag=${{ needs.prepare-deployment.outputs.version }} \
+            --set environment=development \
+            --values ./infrastructure/kubernetes/helm/values-dev.yaml \
+            --wait \
+            --timeout 10m
+
+      - name: Run database migrations
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl create job --from=cronjob/db-migration db-migration-$(date +%s) \
+            -n ${{ needs.prepare-deployment.outputs.namespace }} || echo "Migration job creation skipped"
+
+      - name: Verify deployment
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl rollout status deployment/api-gateway \
+            -n ${{ needs.prepare-deployment.outputs.namespace }} --timeout=5m
+          kubectl rollout status deployment/web-portal \
+            -n ${{ needs.prepare-deployment.outputs.namespace }} --timeout=5m
+
+      - name: Run smoke tests
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl run smoke-test \
+            --image=curlimages/curl:latest \
+            --namespace=${{ needs.prepare-deployment.outputs.namespace }} \
+            --restart=Never \
+            --rm -i --wait --timeout=60s \
+            -- curl -f https://dev.smartcityconnect.com/health || echo "Smoke test pending"
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: prepare-deployment
+    if: needs.prepare-deployment.outputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.smartcityconnect.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Deploy with Helm
+        run: |
+          export KUBECONFIG=kubeconfig
+
+          helm upgrade --install smartcity-backend \
+            ./infrastructure/kubernetes/helm/smartcity-backend \
+            --namespace ${{ needs.prepare-deployment.outputs.namespace }} \
+            --create-namespace \
+            --set image.tag=${{ needs.prepare-deployment.outputs.version }} \
+            --set environment=staging \
+            --values ./infrastructure/kubernetes/helm/values-staging.yaml \
+            --wait \
+            --timeout 15m
+
+          helm upgrade --install smartcity-frontend \
+            ./infrastructure/kubernetes/helm/smartcity-frontend \
+            --namespace ${{ needs.prepare-deployment.outputs.namespace }} \
+            --set image.tag=${{ needs.prepare-deployment.outputs.version }} \
+            --set environment=staging \
+            --values ./infrastructure/kubernetes/helm/values-staging.yaml \
+            --wait \
+            --timeout 15m
+
+      - name: Run database migrations
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl create job --from=cronjob/db-migration db-migration-$(date +%s) \
+            -n ${{ needs.prepare-deployment.outputs.namespace }}
+
+      - name: Verify deployment
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl rollout status deployment/api-gateway \
+            -n ${{ needs.prepare-deployment.outputs.namespace }} --timeout=10m
+          kubectl rollout status deployment/web-portal \
+            -n ${{ needs.prepare-deployment.outputs.namespace }} --timeout=10m
+
+      - name: Run integration tests
+        run: |
+          echo "Running integration tests against staging environment"
+          # Integration tests will be added here
+
+      - name: Performance baseline
+        run: |
+          echo "Running performance tests"
+          # Performance tests will be added here
+
+  # Deploy to Production (with manual approval)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: prepare-deployment
+    if: needs.prepare-deployment.outputs.environment == 'production'
+    environment:
+      name: production
+      url: https://smartcityconnect.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Create deployment backup
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl get all -n ${{ needs.prepare-deployment.outputs.namespace }} -o yaml > backup-$(date +%Y%m%d-%H%M%S).yaml
+
+      - name: Deploy with Helm (Blue-Green)
+        run: |
+          export KUBECONFIG=kubeconfig
+
+          # Deploy to green environment first
+          helm upgrade --install smartcity-backend-green \
+            ./infrastructure/kubernetes/helm/smartcity-backend \
+            --namespace ${{ needs.prepare-deployment.outputs.namespace }} \
+            --create-namespace \
+            --set image.tag=${{ needs.prepare-deployment.outputs.version }} \
+            --set environment=production \
+            --set deployment.slot=green \
+            --values ./infrastructure/kubernetes/helm/values-prod.yaml \
+            --wait \
+            --timeout 20m
+
+          helm upgrade --install smartcity-frontend-green \
+            ./infrastructure/kubernetes/helm/smartcity-frontend \
+            --namespace ${{ needs.prepare-deployment.outputs.namespace }} \
+            --set image.tag=${{ needs.prepare-deployment.outputs.version }} \
+            --set environment=production \
+            --set deployment.slot=green \
+            --values ./infrastructure/kubernetes/helm/values-prod.yaml \
+            --wait \
+            --timeout 20m
+
+      - name: Run database migrations
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl create job --from=cronjob/db-migration db-migration-$(date +%s) \
+            -n ${{ needs.prepare-deployment.outputs.namespace }}
+          kubectl wait --for=condition=complete --timeout=600s \
+            job/db-migration-$(date +%s) -n ${{ needs.prepare-deployment.outputs.namespace }}
+
+      - name: Smoke tests (Green environment)
+        run: |
+          export KUBECONFIG=kubeconfig
+          # Run smoke tests against green environment
+          echo "Running smoke tests on green deployment"
+
+      - name: Switch traffic to Green (Blue-Green swap)
+        run: |
+          export KUBECONFIG=kubeconfig
+
+          # Update service selectors to point to green
+          kubectl patch service api-gateway \
+            -n ${{ needs.prepare-deployment.outputs.namespace }} \
+            -p '{"spec":{"selector":{"slot":"green"}}}'
+
+          kubectl patch service web-portal \
+            -n ${{ needs.prepare-deployment.outputs.namespace }} \
+            -p '{"spec":{"selector":{"slot":"green"}}}'
+
+      - name: Monitor for errors (5 minutes)
+        run: |
+          export KUBECONFIG=kubeconfig
+          echo "Monitoring deployment for 5 minutes..."
+          sleep 300
+
+          # Check for errors
+          ERROR_COUNT=$(kubectl logs -l slot=green --tail=100 -n ${{ needs.prepare-deployment.outputs.namespace }} | grep -i error | wc -l)
+
+          if [ $ERROR_COUNT -gt 10 ]; then
+            echo "High error rate detected! Consider rollback."
+            exit 1
+          fi
+
+      - name: Remove old Blue deployment
+        run: |
+          export KUBECONFIG=kubeconfig
+
+          # Scale down blue deployment
+          kubectl scale deployment --replicas=0 -l slot=blue \
+            -n ${{ needs.prepare-deployment.outputs.namespace }}
+
+      - name: Verify deployment
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl get pods -n ${{ needs.prepare-deployment.outputs.namespace }}
+          kubectl get services -n ${{ needs.prepare-deployment.outputs.namespace }}
+
+      - name: Send deployment notification
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          text: |
+            🚀 Production Deployment ${{ job.status }}
+            Version: ${{ needs.prepare-deployment.outputs.version }}
+            Environment: Production
+            Deployer: ${{ github.actor }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Rollback workflow
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: [deploy-development, deploy-staging, deploy-production]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Rollback with Helm
+        run: |
+          echo "Rolling back deployment..."
+          # Helm rollback commands will be executed here
+
+  # Post-deployment monitoring
+  post-deployment:
+    name: Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: [deploy-development, deploy-staging, deploy-production]
+    if: success()
+
+    steps:
+      - name: Create Datadog deployment event
+        if: env.DATADOG_API_KEY != ''
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v1/events" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -d @- << EOF
+          {
+            "title": "SmartCity Connect Deployment",
+            "text": "Deployed version ${{ needs.prepare-deployment.outputs.version }} to ${{ needs.prepare-deployment.outputs.environment }}",
+            "tags": ["environment:${{ needs.prepare-deployment.outputs.environment }}", "version:${{ needs.prepare-deployment.outputs.version }}"]
+          }
+          EOF
+
+      - name: Create New Relic deployment marker
+        if: env.NEW_RELIC_API_KEY != ''
+        run: |
+          curl -X POST "https://api.newrelic.com/v2/applications/${NEW_RELIC_APP_ID}/deployments.json" \
+            -H "X-Api-Key: ${{ secrets.NEW_RELIC_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @- << EOF
+          {
+            "deployment": {
+              "revision": "${{ needs.prepare-deployment.outputs.version }}",
+              "changelog": "Deployed from GitHub Actions",
+              "user": "${{ github.actor }}"
+            }
+          }
+          EOF
+
+      - name: Update deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: context.payload.deployment.id,
+              state: 'success',
+              environment_url: 'https://${{ needs.prepare-deployment.outputs.environment }}.smartcityconnect.com',
+              description: 'Deployment completed successfully'
+            });

@@ -1,0 +1,78 @@
+# Auto-labeler configuration for pull requests
+# Labels are applied based on which files are changed
+
+# Backend changes
+backend:
+  - backend/**/*
+
+# Frontend changes
+frontend:
+  - frontend/**/*
+
+# Mobile changes
+mobile:
+  - frontend/mobile-apps/**/*
+
+# Infrastructure changes
+infrastructure:
+  - infrastructure/**/*
+  - docker-compose.yml
+  - .github/workflows/**/*
+
+# Database changes
+database:
+  - '**/*migration*/**/*'
+  - '**/*schema*.sql'
+  - backend/**/repository/**/*
+
+# API changes
+api:
+  - backend/**/controller/**/*
+  - backend/**/api/**/*
+  - '**/openapi*.yaml'
+  - '**/swagger*.yaml'
+
+# Documentation changes
+documentation:
+  - '**/*.md'
+  - docs/**/*
+  - README*
+
+# ML/AI changes
+machine-learning:
+  - ml-models/**/*
+
+# Security changes
+security:
+  - '**/security/**/*'
+  - '**/*auth*/**/*'
+  - '**/*oauth*/**/*'
+
+# Testing changes
+testing:
+  - '**/*test*/**/*'
+  - '**/*.test.*'
+  - '**/*.spec.*'
+  - tests/**/*
+
+# CI/CD changes
+ci-cd:
+  - .github/**/*
+  - scripts/ci/**/*
+
+# Configuration changes
+configuration:
+  - '**/*.yml'
+  - '**/*.yaml'
+  - '**/*.json'
+  - '**/*.properties'
+  - '**/*.env*'
+
+# Dependencies
+dependencies:
+  - '**/package.json'
+  - '**/package-lock.json'
+  - '**/pom.xml'
+  - '**/requirements.txt'
+  - '**/go.mod'
+  - '**/Cargo.toml'
